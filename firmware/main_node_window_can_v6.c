@@ -6,7 +6,9 @@
  *       -> 각도 값만 들어오면 그대로 씀. 읽기 실패는 건너뛰고 마지막 값 유지
  *     - 1ms 사이 말도 안 되게 튀는 값(ENC_JUMP_MAX 초과)은 잘못 읽은 걸로 보고 버림
  *     - 엔코더가 ENC_LOST_MS 넘게 아예 안 읽히면: 이동만 멈추고(고장코드 1 표시), 다시 읽히면 자동 복귀
- *     - 엔코더 걸림 감지는 기본 끔(USE_STALL_CHECK). 대신 이동 시간 제한(MOVE_TIMEOUT_MS) + 전류 끼임 감지
+ *     - 모터는 도는데 각도가 안 변하면 정지(USE_STALL_CHECK, 저속에서도 감시) + 이동 시간 제한(MOVE_TIMEOUT_MS) + 전류 끼임 감지
+ *   [v6.1] 오류 플래그 선 SPI 프레임은 다시 버림 (각도가 아닌 값이 섞여 위치가 멈추던 문제),
+ *          걸림 감지 기본 켬 + 5rpm 저속에서도 감시 (목표 근처에서 계속 도는 문제)
  *   v5 기능: 구역 공기질 ENS160 + MQ-7, 구역별 창문 목표, 마스터 온습도 보정, 구역 경고 부저 그대로
  *
  *   ★ 보드마다 아래 설정만 바꿔서 올리세요 ★
@@ -60,7 +62,7 @@
  *   LED: NORMAL PC10, RUN PC11, Red PB7
  *
  * ---------------- 디버깅 (Live Expressions) ----------------
- *   g_pos, g_target, g_pct, g_enc_raw, g_enc_pos, g_enc_alive, g_enc_err, g_enc_jump, g_last_rx,
+ *   g_pos, g_target, g_err, g_pct, g_enc_raw, g_enc_pos, g_enc_alive, g_enc_err, g_enc_jump, g_last_rx,
  *   g_i_ma, g_i_base, g_load_pct, g_vbus_mv, g_fault_reason, g_fan_now, g_tdrv_c, g_tpwr_c,
  *   g_gw_down, g_gw_up, g_co_ppm, g_co_mv, g_ens_ok, g_ens_valid, g_tvoc, g_eco2, g_ens_aqi
  */
@@ -113,7 +115,7 @@ UART_HandleTypeDef  huart2;
 #define ENC_LOST_MS          300U       /* 이 시간 동안 한 번도 못 읽으면 '엔코더 끊김' -> 이동 멈춤 */
 #define MOVE_TIMEOUT_MS      15000U     /* 한 번 이동이 이 시간 넘게 안 끝나면 멈춤 (고장코드 2). 0 = 끔 */
 #define BACKOFF_TIMEOUT_MS   2000U      /* 끼임 후 되돌아가기 최대 시간 */
-#define USE_STALL_CHECK      0          /* 1: 엔코더가 안 움직이면 걸림으로 판단 (엔코더가 잘 읽힐 때만 켜세요) */
+#define USE_STALL_CHECK      1          /* 1: 모터는 도는데 엔코더 각도가 안 변하면 멈춤 (고장코드 2) — 끝없이 도는 것 방지 */
 #define USE_RANGE_FAULT      0          /* 1: 위치가 0~100% 범위를 크게 벗어나면 고장(코드 3)으로 정지 */
 
 /* =====================================================================
@@ -237,10 +239,10 @@ UART_HandleTypeDef  huart2;
 #define SW_ZERO_MS       2000U    /* 2초 넘게 누르고 떼면 0도 저장 */
 
 /* ===================== 걸림 감지 (USE_STALL_CHECK=1 일 때만) ===================== */
-#define STALL_WATCH_RPM  8.0f
+#define STALL_WATCH_RPM  4.0f      /* 목표 근처 저속(5rpm)에서도 감시 */
 #define STALL_SETTLE_MS  300U
 #define STALL_WINDOW_MS  500U
-#define STALL_MIN_MOVE   250
+#define STALL_MIN_MOVE   150       /* 5rpm 이면 500ms 에 약 680 카운트 움직여야 정상 */
 #define STALL_WINDOWS    2U
 
 /* ===================== 상태 ===================== */
@@ -296,6 +298,7 @@ volatile uint8_t  g_fault_reason = 0;
 
 /* 위치 제어 */
 volatile int32_t  g_target = 0;
+volatile int32_t  g_err = 0;           /* 목표 - 현재 위치 (카운트, 디버깅) */
 volatile uint8_t  g_tgt_pct = 0;
 volatile uint8_t  g_pct = 0;
 static uint8_t    pinch_tgt_pct = 0;
@@ -354,7 +357,7 @@ static uint8_t AS_Transfer(uint16_t tx, uint16_t *rx)
 }
 
 /* 각도(ANGLECOM) 한 번 읽기. 자석 세기/진단은 보지 않음.
- * 오류 플래그(bit14)가 서 있어도 각도 값은 그대로 쓰고, 플래그만 지워 둠 */
+ * 오류 플래그(bit14)가 선 프레임은 버림 (읽기 실패로만 셈, 고장으로 멈추지는 않음) */
 static uint8_t AS_ReadAngle(uint16_t *val)
 {
     uint16_t rx;
@@ -367,12 +370,13 @@ static uint8_t AS_ReadAngle(uint16_t *val)
 
     if (rx == 0xFFFFU) return 0;                    /* MISO 가 High 로 붙음 = 응답 없음 */
     if (AS_EvenParity(rx) != rx) return 0;          /* 패리티 틀림 = 깨진 값 */
-    if (rx & 0x4000U)
+    if (rx & 0x4000U)                               /* 오류 플래그: 이 프레임의 값은 각도가 아닐 수 있음 -> 버리고 플래그만 지움 */
     {
         uint16_t dummy;
         uint16_t ecmd = AS_EvenParity((uint16_t)(0x4000U | AS_ERRFL));
         AS_Transfer(ecmd, &dummy);
         AS_Transfer(nop, &dummy);
+        return 0;
     }
     *val = rx & 0x3FFFU;
     return 1;
@@ -710,6 +714,7 @@ static void Stepper_1ms(void)
     g_pos = g_enc_pos * g_enc_sign * ((OPEN_DIR == DIR_CW) ? 1 : -1);
     int32_t p = g_pos * 100 / WIN_FULL_COUNTS;
     g_pct = (uint8_t)(p < 0 ? 0 : (p > 100 ? 100 : p));
+    g_err = g_target - g_pos;
 
 #if USE_RANGE_FAULT
     if (enc_sign_known && state != ST_FAULT &&
