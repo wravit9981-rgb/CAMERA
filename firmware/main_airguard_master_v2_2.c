@@ -15,6 +15,8 @@
  *   - [v2.1] 부저: 종합 등급이 3단계(위험)에 처음 도달할 때만 "삑(0.5) 쉼 삑(0.5) 쉼 삐-(1.5)", 3단계 전에는 절대 안 울림
  *            (구역 경고 부저는 각 창문 노드의 PB11 이 담당)
  *   - [v2.2] 미세먼지 TIM3 채널 뒤바뀜 수정 (CH2 = 주기, CH1 = High)
+ *            + 새 펄스가 잡혔을 때만 읽고, 펄스가 끊기면 핀 상태로 0%/100% (값이 안 내려가던 문제)
+ *            + 디버깅 키 dust_duty (x10 %), dust_per (주기 us), dust_ne (1 = 펄스 없음)
  *   - [v2.2] 남은 시간 표시: 창문 노드 v5.8 의 0x131/0x132 (닫기 대기 / 끼임 재시도) 수신
  *            + 마스터 등급 하향 확인 남은 시간 -> 텔레메트리 키 (창문 n = 1, 2)
  *              w{n}dn  등급 하향 확인 남은 ms (0 = 확인 중 아님)    w{n}tg  노드가 실제로 가는 목표 %
@@ -67,6 +69,7 @@ WWDG_HandleTypeDef  hwwdg;
 
 #define DUST_DIVIDER        1.0f     /* PA4 앞 분압비 */
 #define DUST_UG_PER_V       200.0f   /* 1V 상승 = 200 µg/m³ */
+#define DUST_NOEDGE_MS      200U     /* 이 시간 동안 펄스가 없으면 핀 상태로 0% / 100% 판단 (TIM3 16비트 = 최대 65ms 주기) */
 
 /* 등급 기준: 주의 / 경고 / 위험  (대시보드 TH 와 같은 값) */
 static const float TH_CO[3]   = { 10.0f, 30.0f, 50.0f };       /* ppm   구역 노드 MQ-7   */
@@ -397,20 +400,41 @@ static float raw_to_mv(uint16_t raw, float divider)
 }
 
 /* ---- 미세먼지 PWM 주기 및 Duty 측정 ---- */
+volatile uint32_t dust_period_us = 0, dust_high_us = 0;   /* 디버깅: 마지막으로 잰 주기 / High 시간 */
+volatile uint8_t  dust_noedge = 0;                        /* 1 = 펄스가 안 들어옴 (핀이 계속 High 또는 Low) */
+
 static void Dust_Sample_PWM(void)
 {
-    /* PA4 = TIM3_CH2 입력 -> CH2: Period(주기, 리셋 기준), CH1: Pulse Width(High 구간)  [v2.2 채널 뒤바뀜 수정] */
-    uint32_t period = HAL_TIM_ReadCapturedValue(&htim3, TIM_CHANNEL_2);
-    uint32_t high   = HAL_TIM_ReadCapturedValue(&htim3, TIM_CHANNEL_1);
+    static uint32_t last_edge_ms = 0;
+    uint32_t now = HAL_GetTick();
+    float duty;
 
-    if (period > 0)
+    /* [v2.2] 새로 잡힌 주기가 있을 때만 읽음.
+     * 예전엔 캡처 레지스터를 그냥 읽어서, 펄스가 멈추면(공기가 깨끗해 출력이 계속 Low 등) 마지막 값이 그대로 남아
+     * 수치가 안 내려갔음 */
+    if (__HAL_TIM_GET_FLAG(&htim3, TIM_FLAG_CC2))
     {
-        dust_duty = ((float)high / (float)period) * 100.0f; /* % 단위 */
-
-        /* Duty 비율을 mV 단위 등가 값으로 환산 (3.3V 기준) */
-        float mv = (dust_duty / 100.0f) * 3300.0f * DUST_DIVIDER;
-        dust_f = (dust_f <= 0.0f) ? mv : dust_f + (mv - dust_f) * 0.05f;
+        /* PA4 = TIM3_CH2 입력 -> CH2: Period(주기, 리셋 기준), CH1: Pulse Width(High 구간)  [v2.2 채널 뒤바뀜 수정] */
+        uint32_t period = HAL_TIM_ReadCapturedValue(&htim3, TIM_CHANNEL_2);   /* 읽으면 CC2 플래그도 지워짐 */
+        uint32_t high   = HAL_TIM_ReadCapturedValue(&htim3, TIM_CHANNEL_1);
+        __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_CC2 | TIM_FLAG_CC1 | TIM_FLAG_CC2OF | TIM_FLAG_CC1OF);
+        if (period == 0 || high > period) return;                            /* 잘못 잡힌 값 */
+        dust_period_us = period; dust_high_us = high;
+        last_edge_ms = now; dust_noedge = 0;
+        duty = (float)high / (float)period * 100.0f;
     }
+    else if ((now - last_edge_ms) >= DUST_NOEDGE_MS)
+    {
+        /* 펄스가 끊김 -> 핀 상태 그대로 0% 또는 100% */
+        dust_noedge = 1;
+        duty = (HAL_GPIO_ReadPin(DUST_PWM_PORT, DUST_PWM_PIN) == GPIO_PIN_SET) ? 100.0f : 0.0f;
+    }
+    else return;                                                             /* 다음 펄스 기다림 */
+
+    dust_duty = duty;
+    /* Duty 비율을 mV 단위 등가 값으로 환산 (3.3V 기준) */
+    float mv = (duty / 100.0f) * 3300.0f * DUST_DIVIDER;
+    dust_f = (dust_f <= 0.0f) ? mv : dust_f + (mv - dust_f) * 0.05f;
 }
 
 /* ---- 먼지 기준선 갱신 및 환산 (1초 마다) ---- */
@@ -1162,9 +1186,10 @@ static void Tele_Send(void)
     for (int k = 0; k < 2; k++)
         J("\"n%d_v\":%s,\"n%d_tdrv\":%d,\"n%d_tpwr\":%d,\"n%d_agc\":%u,\"n%d_ang\":%u,",
           k + 1, nv[k], k + 1, (int)nst[k].tdrv, k + 1, (int)nst[k].tpwr, k + 1, (unsigned)nst[k].agc, k + 1, (unsigned)nst[k].ang);
-    J("\"can_tx\":%lu,\"can_rx\":%lu,\"busoff\":%lu,\"state\":%d,\"rpm\":%d,\"warm\":%d,\"dht\":%d,\"dust_mv\":%ld,\"dust_base\":%ld}\n",
+    J("\"can_tx\":%lu,\"can_rx\":%lu,\"busoff\":%lu,\"state\":%d,\"rpm\":%d,\"warm\":%d,\"dht\":%d,\"dust_mv\":%ld,\"dust_base\":%ld,\"dust_duty\":%d,\"dust_per\":%lu,\"dust_ne\":%u}\n",
       (unsigned long)can_tx_cnt, (unsigned long)can_rx_cnt, (unsigned long)can_busoff,
-      (int)state, (int)(cur_rpm * (float)dir), warm_done ? 0 : 1, (int)dht_err, (long)dust_mv, (long)dust_base_mv);
+      (int)state, (int)(cur_rpm * (float)dir), warm_done ? 0 : 1, (int)dht_err, (long)dust_mv, (long)dust_base_mv,
+      (int)(dust_duty * 10.0f), (unsigned long)dust_period_us, (unsigned)dust_noedge);
 
     if (tele_n >= (int)sizeof(tele_buf)) { tele_n = 0; return; }   /* 잘린 줄은 보내지 않음 */
     tele_len = (uint16_t)tele_n; tele_pos1 = 0; tele_pos2 = 0;
