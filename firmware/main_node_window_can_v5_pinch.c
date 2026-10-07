@@ -1,5 +1,5 @@
 /*
- * main_node_window_can_v5_pinch.c (v5.7) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
+ * main_node_window_can_v5_pinch.c (v5.8) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
  *   v5.1 그대로 + [끼임 보강]
  *     - 끼임 판단: INA240 전류 상승  "또는"  전원 전압(PB0) 강하
  *       (모터가 막히면 전류가 오르고, 전원이 약하면 전압이 순간적으로 떨어짐 -> 둘 중 하나라도 일정 시간 계속되면 끼임)
@@ -15,6 +15,11 @@
  *       최대 PINCH_RETRY_MAX(3)번. 그래도 막히면 끼임 정지 유지 (SW 짧게 / 새 목표로 해제)
  *       목표에 제대로 도착하면 재시도 횟수 초기화.  디버깅: g_pinch_retry, g_close_wait
  *   [v5.7] 닫다가 "전압 강하"로 끼임이 감지되면: 부저 1번 + 초록 LED(NORMAL, PC10) 0.1초 간격으로 3번 깜빡 (0.6초)
+ *   [v5.8] 0x130+NODE_ID 창문 이벤트 (200ms) -> 마스터 -> 대시보드에 "닫기 대기 n초 / 끼임 재시도 n초" 표시
+ *     [0] 플래그 bit0 닫기 대기 중, bit1 끼임 처리 중(되돌아감/정지), bit2 재시도 다 씀, bit3 되돌아가는 중
+ *     [1] 닫기 대기 남은 시간 (0.1초 단위, 최대 255)   [2] 끼임 재시도까지 남은 시간 (0.1초 단위)
+ *     [3] 재시도 한 횟수   [4] 최대 재시도 횟수   [5] 끼임 원인 (1 전류, 2 전압, 3 걸림)
+ *     [6] 대기 중인 닫는 목표 % (0xFF = 없음)   [7] 순번
  *   v4 + [추가] 구역 공기질 센서: ENS160 (I2C4, TVOC/eCO2/AQI) + MQ-7 일산화탄소 (PC5 아날로그)
  *        -> 0x120+NODE_ID 로 송신 (마스터가 구역별 위험 등급 판정, 패널/대시보드 표시)
  *        + [추가] 마스터가 구역별 창문 목표를 보내면 (0x100 [4] bit1) 자기 구역 목표 [4+NODE_ID] 를 따름
@@ -209,6 +214,8 @@ UART_HandleTypeDef  huart2;
 #define CAN_ID_AIR           (0x120U + NODE_ID)   /* 구역 공기질 (CO/TVOC/eCO2) */
 #define CAN_ID_ENV           0x120U               /* 마스터 환경 (먼지/온습도) */
 #define CAN_ID_FAN           0x201U
+#define CAN_ID_EVT           (0x130U + NODE_ID)   /* 창문 이벤트 (닫기 대기 / 끼임 재시도 남은 시간) */
+#define EVT_TX_MS            200U
 
 /* ===================== 핀 ===================== */
 #define SW1_PORT         GPIOB
@@ -358,6 +365,8 @@ static uint32_t   backoff_ms = 0;
 static uint32_t   pinched_ms = 0;      /* 끼임 정지 상태가 된 시각 */
 volatile uint8_t  g_pinch_retry = 0;   /* 이번 목표에서 끼임 후 다시 시도한 횟수 */
 volatile uint8_t  g_close_wait = 0;    /* 1 = 닫는 목표를 5초 확인 중 */
+static uint8_t    close_wait_pct = 0xFFU;   /* 확인 중인 닫는 쪽 목표 (0xFF = 없음) */
+static uint32_t   close_wait_ms = 0;        /* 그 목표를 처음 받은 시각 */
 
 /* 전류 / 전압 / 온도 */
 volatile float    g_i_ma = 0.0f;
@@ -1419,7 +1428,7 @@ static void CAN_BusOffRecover(FDCAN_HandleTypeDef *hc)
 /* 이 노드가 직접 보내는 ID (중계하지 않음) */
 static uint8_t CAN_IsMine(uint32_t id)
 {
-    if (id == CAN_ID_ME || id == CAN_ID_ST || id == CAN_ID_AIR) return 1;
+    if (id == CAN_ID_ME || id == CAN_ID_ST || id == CAN_ID_AIR || id == CAN_ID_EVT) return 1;
 #if FAN_ON_THIS_NODE
     if (id == CAN_ID_FAN) return 1;
 #endif
@@ -1453,26 +1462,24 @@ static void CAN_Poll(void)
         if (h.Identifier != CAN_ID_CMD) continue;
         {
             static uint8_t  last_cmd_pct = 0xFFU;     /* 마지막으로 적용한 마스터 목표 */
-            static uint8_t  wait_pct = 0xFFU;         /* 확인 중인 닫는 쪽 목표 */
-            static uint32_t wait_ms = 0;
             uint8_t raw = (d[4] & 0x02U) ? d[4 + NODE_ID] : d[1];   /* 구역별 목표가 있으면 내 구역 것 */
             uint8_t p = Snap_Pct(raw > 100 ? 100 : raw);
             uint32_t now = HAL_GetTick();
 
             if (p == last_cmd_pct || state == ST_CAL || state == ST_FAULT)
-                wait_pct = 0xFFU;                     /* 원래 목표로 돌아옴 -> 닫기 취소 */
+                close_wait_pct = 0xFFU;                     /* 원래 목표로 돌아옴 -> 닫기 취소 */
             else if (last_cmd_pct != 0xFFU && p < last_cmd_pct)
             {
                 /* 닫는 쪽: 같은 목표가 CLOSE_DELAY_MS 동안 계속 와야 적용 (히스테리시스) */
-                if (wait_pct != p) { wait_pct = p; wait_ms = now; }
-                else if ((now - wait_ms) >= CLOSE_DELAY_MS && Set_Target_Pct(p)) { last_cmd_pct = p; wait_pct = 0xFFU; }
+                if (close_wait_pct != p) { close_wait_pct = p; close_wait_ms = now; }
+                else if ((now - close_wait_ms) >= CLOSE_DELAY_MS && Set_Target_Pct(p)) { last_cmd_pct = p; close_wait_pct = 0xFFU; }
             }
             else
             {
-                wait_pct = 0xFFU;                     /* 여는 쪽(또는 첫 명령): 바로 적용 */
+                close_wait_pct = 0xFFU;                     /* 여는 쪽(또는 첫 명령): 바로 적용 */
                 if (Set_Target_Pct(p)) last_cmd_pct = p;
             }
-            g_close_wait = (wait_pct != 0xFFU) ? 1U : 0U;
+            g_close_wait = (close_wait_pct != 0xFFU) ? 1U : 0U;
         }
         fan_tgt = d[2] > 100 ? 100 : d[2];
         if (d[4] & 0x02U) g_zone_lv = (uint8_t)((d[7] >> ((NODE_ID - 1) * 2)) & 0x03U);   /* 구역 등급 묶음 */
@@ -1546,6 +1553,37 @@ static void CAN_TxAir(void)
     uint8_t  d[8] = { (uint8_t)(co >> 8), (uint8_t)co, (uint8_t)(tv >> 8), (uint8_t)tv,
                       (uint8_t)(ec >> 8), (uint8_t)ec, g_ens_ok ? g_ens_aqi : 0U, fl };
     CAN_SendBoth(CAN_ID_AIR, d);
+}
+
+/* 0x130+NODE_ID 창문 이벤트 : 닫기 대기 / 끼임 재시도 남은 시간 (0.1초 단위) */
+static uint8_t Ds_Left(uint32_t t0, uint32_t span, uint32_t now)
+{
+    uint32_t el = now - t0;
+    uint32_t ds;
+    if (el >= span) return 0U;
+    ds = (span - el + 99U) / 100U;            /* 올림: 남은 0.05초도 1로 */
+    return (uint8_t)(ds > 255U ? 255U : ds);
+}
+
+static void CAN_TxEvt(void)
+{
+    static uint8_t seq = 0;
+    uint32_t now = HAL_GetTick();
+    uint8_t pin = (state == ST_BACKOFF || state == ST_BACKOFF_STOP || state == ST_PINCHED) ? 1U : 0U;
+    uint8_t fl = 0, cw_ds = 0, pr_ds = 0;
+
+    if (close_wait_pct != 0xFFU) { fl |= 0x01U; cw_ds = Ds_Left(close_wait_ms, CLOSE_DELAY_MS, now); }
+    if (pin)                      fl |= 0x02U;
+    if (state == ST_PINCHED)
+    {
+        if (g_pinch_retry >= PINCH_RETRY_MAX) fl |= 0x04U;
+        else pr_ds = Ds_Left(pinched_ms, PINCH_RETRY_MS, now);
+    }
+    if (state == ST_BACKOFF || state == ST_BACKOFF_STOP) fl |= 0x08U;
+
+    uint8_t d[8] = { fl, cw_ds, pr_ds, g_pinch_retry, (uint8_t)PINCH_RETRY_MAX,
+                     pin ? g_pinch_src : 0U, close_wait_pct, seq++ };
+    CAN_SendBoth(CAN_ID_EVT, d);
 }
 
 /* ===================== 구역 경고 부저 (PB11) =====================
@@ -1688,7 +1726,7 @@ int main(void)
 
     last_cyc = DWT->CYCCNT;
     uint32_t last_ms = HAL_GetTick(), t_100 = last_ms, t_st = last_ms + 50U;   /* 상태는 50ms 엇갈려 송신 */
-    uint32_t t_co = last_ms + 25U, t_air = last_ms + 75U, t_1s = last_ms + 500U;
+    uint32_t t_co = last_ms + 25U, t_air = last_ms + 75U, t_1s = last_ms + 500U, t_evt = last_ms + 30U;
 
     while (1)
     {
@@ -1726,6 +1764,7 @@ int main(void)
         if ((int32_t)(now - t_co) >= 100) { t_co = now; Co_100ms(); }
         if ((int32_t)(now - t_1s) >= 1000) { t_1s = now; Co_1s(); Ens_1s(); }
         if ((int32_t)(now - t_air) >= (int32_t)AIR_TX_MS) { t_air = now; CAN_TxAir(); }
+        if ((int32_t)(now - t_evt) >= (int32_t)EVT_TX_MS) { t_evt = now; CAN_TxEvt(); }
     }
 }
 
