@@ -1,5 +1,5 @@
 /*
- * main_node_window_can_v5_pinch.c (v5.8) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
+ * main_node_window_can_v5_pinch.c (v5.9) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
  *   v5.1 그대로 + [끼임 보강]
  *     - 끼임 판단: INA240 전류 상승  "또는"  전원 전압(PB0) 강하
  *       (모터가 막히면 전류가 오르고, 전원이 약하면 전압이 순간적으로 떨어짐 -> 둘 중 하나라도 일정 시간 계속되면 끼임)
@@ -15,6 +15,8 @@
  *       최대 PINCH_RETRY_MAX(3)번. 그래도 막히면 끼임 정지 유지 (SW 짧게 / 새 목표로 해제)
  *       목표에 제대로 도착하면 재시도 횟수 초기화.  디버깅: g_pinch_retry, g_close_wait
  *   [v5.7] 닫다가 "전압 강하"로 끼임이 감지되면: 부저 1번 + 초록 LED(NORMAL, PC10) 0.1초 간격으로 3번 깜빡 (0.6초)
+ *   [v5.9] 끼임(전류/전압/걸림, 여닫는 방향 모두)이 감지되면 부저 0.5초 (PINCH_BUZZ_MS)
+ *          닫다가 전압 강하로 걸리면 초록 LED 3번 깜빡은 v5.7 그대로
  *   [v5.8] 0x130+NODE_ID 창문 이벤트 (200ms) -> 마스터 -> 대시보드에 "닫기 대기 n초 / 끼임 재시도 n초" 표시
  *     [0] 플래그 bit0 닫기 대기 중, bit1 끼임 처리 중(되돌아감/정지), bit2 재시도 다 씀, bit3 되돌아가는 중
  *     [1] 닫기 대기 남은 시간 (0.1초 단위, 최대 255)   [2] 끼임 재시도까지 남은 시간 (0.1초 단위)
@@ -156,7 +158,9 @@ UART_HandleTypeDef  huart2;
 #define PINCH_RETRY_MS       5000U      /* 끼임 정지 후 이 시간 지나면 원래 목표로 다시 시도 */
 #define PINCH_RETRY_MAX      3U         /* 다시 시도 최대 횟수 (0 = 재시도 안 함) */
 /* 닫다가 전압 강하로 끼임이 감지됐을 때 알림 */
-#define VSAG_ALERT_BEEPS     1U         /* 부저 횟수 (한 번 길이 = NODE_BUZZ_ON_MS) */
+#define VSAG_ALERT_BEEPS     1U         /* 부저 횟수 (한 번 길이 = PINCH_BUZZ_MS) */
+#define PINCH_BUZZ_MS        500U       /* [v5.9] 끼임 부저 한 번 길이 (0.5초) */
+#define PINCH_BUZZ_ALL       1          /* [v5.9] 1: 모든 끼임에 부저   0: 닫다가 전압 강하일 때만 (v5.7 방식) */
 #define VSAG_ALERT_LED_MS    600U       /* 초록 LED 점멸 전체 시간 */
 #define VSAG_ALERT_BLINK_MS  100U       /* 켜짐/꺼짐 간격 -> 600ms 동안 3번 깜빡 */
 /* 마스터 목표 히스테리시스 */
@@ -736,6 +740,9 @@ static void Pinch_Start(uint8_t code, uint8_t src)
     pinch_tgt_pct = g_tgt_pct;
     cur_rpm = 0.0f;                        /* 즉시 정지 */
     phase_rate_q16 = 0;
+#if PINCH_BUZZ_ALL
+    buzz_req = VSAG_ALERT_BEEPS;           /* [v5.9] 끼임이면 원인/방향 상관없이 부저 0.5초 */
+#endif
     /* 닫다가(여는 방향의 반대로 가다가) 전압 강하로 걸린 경우: 부저 + 초록 LED 알림 */
     if (src == 2U && dir != OPEN_DIR)
     {
@@ -1602,7 +1609,11 @@ static void Buzz_1ms(void)
     static uint32_t t0 = 0, done_ms = 0;
     uint32_t now = HAL_GetTick();
 
-    if (!left && buzz_req)                           /* 끼임 알림 요청 (구역 경보 중이면 끝난 뒤에) */
+    if (buzz_req && left && !alert)                  /* [v5.9] 구역 경보 중이면 끊고 끼임 알림을 먼저 */
+    {
+        Buzz_Set(0); left = 0; on = 0;
+    }
+    if (!left && buzz_req)                           /* 끼임 알림 요청 */
     {
         left = buzz_req; buzz_req = 0; alert = 1;
         on = 1; t0 = now;
@@ -1612,7 +1623,7 @@ static void Buzz_1ms(void)
 
     if (left)                                        /* 울리는 중 */
     {
-        if (on && (now - t0) >= NODE_BUZZ_ON_MS)
+        if (on && (now - t0) >= (alert ? PINCH_BUZZ_MS : NODE_BUZZ_ON_MS))   /* 끼임 알림은 0.5초 */
         {
             Buzz_Set(0); on = 0; t0 = now;
             if (--left == 0)
