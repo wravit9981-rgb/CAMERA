@@ -9,6 +9,9 @@
  *     - 엔코더 걸림 감지/보정/플래시 0도 저장은 v5.4 스텝 모드에서 이미 꺼져 있음 (각도는 패널 표시용으로만 읽음)
  *     - 주의: 켤 때 창문이 닫혀 있어야 함 (켠 자리 = 0%). 어긋나면 손으로 닫고 SW 2초로 0% 다시 잡기
  *     - 거리 조절: WIN_FULL_COUNTS 만 바꾸면 됨 (16384 = 모터 1바퀴. 예: 조금 덜 열고 싶으면 22000)
+ *   [v5.5.1] 열린 상태 유지 히스테리시스: 여는 쪽은 즉시, 닫는 쪽(더 낮은 %)은 CLOSE_DELAY_MS(5초) 동안
+ *            계속 같은 목표가 와야 닫음. 그 사이 다시 열라는 명령이 오면 닫기 취소
+ *            + 0x130+NODE_ID 이벤트(200ms): 닫기 대기 남은 시간 -> 마스터 v2.2 -> 대시보드 "닫기 대기 n초"
  *   [v5.4] POS_FROM_STEPS = 1 : 창문 위치를 자석 엔코더가 아니라 "모터에 보낸 스텝 수" 로 계산
  *     - 자석이 작거나 중심이 어긋나서 엔코더 각도가 한 바퀴를 다 못 따라가고 좁은 범위(약 20도)에서
  *       왔다 갔다만 하는 보드용. (증상: '여는 중' 인데 개도율이 0% <-> 2% 반복)
@@ -220,6 +223,9 @@ UART_HandleTypeDef  huart2;
 #define CAN_ID_AIR           (0x120U + NODE_ID)   /* 구역 공기질 (CO/TVOC/eCO2) */
 #define CAN_ID_ENV           0x120U               /* 마스터 환경 (먼지/온습도) */
 #define CAN_ID_FAN           0x201U
+#define CAN_ID_EVT           (0x130U + NODE_ID)   /* 창문 이벤트: [0]bit0 닫기대기 [1]남은 0.1초 [6]대기 목표% [7]seq */
+#define EVT_TX_MS            200U
+#define CLOSE_DELAY_MS       5000U      /* [v5.5.1] 닫기 전 대기 (열린 상태 유지). 0 = 바로 닫음 */
 
 /* ===================== 핀 ===================== */
 #define SW1_PORT         GPIOB
@@ -1556,12 +1562,15 @@ static void CAN_BusOffRecover(FDCAN_HandleTypeDef *hc)
 /* 이 노드가 직접 보내는 ID (중계하지 않음) */
 static uint8_t CAN_IsMine(uint32_t id)
 {
-    if (id == CAN_ID_ME || id == CAN_ID_ST || id == CAN_ID_AIR) return 1;
+    if (id == CAN_ID_ME || id == CAN_ID_ST || id == CAN_ID_AIR || id == CAN_ID_EVT) return 1;
 #if FAN_ON_THIS_NODE
     if (id == CAN_ID_FAN) return 1;
 #endif
     return 0;
 }
+
+static uint8_t  close_wait_pct = 0xFFU;   /* 확인 중인 닫는 쪽 목표 (0xFF = 없음) */
+static uint32_t close_wait_ms = 0;        /* 그 목표를 처음 받은 시각 */
 
 static void CAN_Poll(void)
 {
@@ -1592,7 +1601,21 @@ static void CAN_Poll(void)
             static uint8_t last_cmd_pct = 0xFFU;      /* 마지막으로 적용한 마스터 목표 */
             uint8_t raw = (d[4] & 0x02U) ? d[4 + NODE_ID] : d[1];   /* 구역별 목표가 있으면 내 구역 것 */
             uint8_t p = Snap_Pct(raw > 100 ? 100 : raw);
-            if (p != last_cmd_pct && state != ST_CAL && state != ST_FAULT && Set_Target_Pct(p)) last_cmd_pct = p;
+            uint32_t now = HAL_GetTick();
+
+            if (p == last_cmd_pct || state == ST_CAL || state == ST_FAULT)
+                close_wait_pct = 0xFFU;               /* 원래 목표로 돌아옴 -> 닫기 취소 */
+            else if (last_cmd_pct != 0xFFU && p < last_cmd_pct)
+            {
+                /* 닫는 쪽: 같은 목표가 CLOSE_DELAY_MS 동안 계속 와야 적용 (열린 상태 유지) */
+                if (close_wait_pct != p) { close_wait_pct = p; close_wait_ms = now; }
+                if ((now - close_wait_ms) >= CLOSE_DELAY_MS && Set_Target_Pct(p)) { last_cmd_pct = p; close_wait_pct = 0xFFU; }
+            }
+            else
+            {
+                close_wait_pct = 0xFFU;               /* 여는 쪽(또는 첫 명령): 바로 적용 */
+                if (Set_Target_Pct(p)) last_cmd_pct = p;
+            }
         }
         fan_tgt = d[2] > 100 ? 100 : d[2];
         if (d[4] & 0x02U) g_zone_lv = (uint8_t)((d[7] >> ((NODE_ID - 1) * 2)) & 0x03U);   /* 구역 등급 묶음 */
@@ -1667,6 +1690,22 @@ static void CAN_TxAir(void)
     uint8_t  d[8] = { (uint8_t)(co >> 8), (uint8_t)co, (uint8_t)(tv >> 8), (uint8_t)tv,
                       (uint8_t)(ec >> 8), (uint8_t)ec, g_ens_ok ? g_ens_aqi : 0U, fl };
     CAN_SendBoth(CAN_ID_AIR, d);
+}
+
+/* 0x130+NODE_ID 창문 이벤트 (마스터 v2.2 가 대시보드 "닫기 대기 n초" 로 표시) */
+static void CAN_TxEvt(void)
+{
+    static uint8_t seq = 0;
+    uint8_t fl = 0, cw_ds = 0;
+    if (close_wait_pct != 0xFFU)
+    {
+        uint32_t el = HAL_GetTick() - close_wait_ms, ds;
+        fl = 0x01U;
+        ds = (el >= CLOSE_DELAY_MS) ? 0U : (CLOSE_DELAY_MS - el + 99U) / 100U;
+        cw_ds = (uint8_t)(ds > 255U ? 255U : ds);
+    }
+    uint8_t d[8] = { fl, cw_ds, 0, 0, 0, 0, close_wait_pct, seq++ };
+    CAN_SendBoth(CAN_ID_EVT, d);
 }
 
 /* ===================== 구역 경고 부저 (PB11) =====================
@@ -1793,7 +1832,7 @@ int main(void)
 
     last_cyc = DWT->CYCCNT;
     uint32_t last_ms = HAL_GetTick(), t_100 = last_ms, t_st = last_ms + 50U;   /* 상태는 50ms 엇갈려 송신 */
-    uint32_t t_co = last_ms + 25U, t_air = last_ms + 75U, t_1s = last_ms + 500U;
+    uint32_t t_co = last_ms + 25U, t_air = last_ms + 75U, t_1s = last_ms + 500U, t_evt = last_ms + 30U;
 
     while (1)
     {
@@ -1832,6 +1871,7 @@ int main(void)
         if ((int32_t)(now - t_co) >= 100) { t_co = now; Co_100ms(); }
         if ((int32_t)(now - t_1s) >= 1000) { t_1s = now; Co_1s(); Ens_1s(); }
         if ((int32_t)(now - t_air) >= (int32_t)AIR_TX_MS) { t_air = now; CAN_TxAir(); }
+        if ((int32_t)(now - t_evt) >= (int32_t)EVT_TX_MS) { t_evt = now; CAN_TxEvt(); }
     }
 }
 
