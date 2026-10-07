@@ -1,5 +1,5 @@
 /*
- * main_node_window_can_v5_pinch.c (v5.6) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
+ * main_node_window_can_v5_pinch.c (v5.7) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
  *   v5.1 그대로 + [끼임 보강]
  *     - 끼임 판단: INA240 전류 상승  "또는"  전원 전압(PB0) 강하
  *       (모터가 막히면 전류가 오르고, 전원이 약하면 전압이 순간적으로 떨어짐 -> 둘 중 하나라도 일정 시간 계속되면 끼임)
@@ -14,6 +14,7 @@
  *     - 끼임으로 5% 되돌아가 멈춘 뒤 PINCH_RETRY_MS(5초) 지나면 원래 목표(예: 0%)로 다시 이동
  *       최대 PINCH_RETRY_MAX(3)번. 그래도 막히면 끼임 정지 유지 (SW 짧게 / 새 목표로 해제)
  *       목표에 제대로 도착하면 재시도 횟수 초기화.  디버깅: g_pinch_retry, g_close_wait
+ *   [v5.7] 닫다가 "전압 강하"로 끼임이 감지되면: 부저 1번 + 초록 LED(NORMAL, PC10) 0.1초 간격으로 3번 깜빡 (0.6초)
  *   v4 + [추가] 구역 공기질 센서: ENS160 (I2C4, TVOC/eCO2/AQI) + MQ-7 일산화탄소 (PC5 아날로그)
  *        -> 0x120+NODE_ID 로 송신 (마스터가 구역별 위험 등급 판정, 패널/대시보드 표시)
  *        + [추가] 마스터가 구역별 창문 목표를 보내면 (0x100 [4] bit1) 자기 구역 목표 [4+NODE_ID] 를 따름
@@ -149,6 +150,10 @@ UART_HandleTypeDef  huart2;
 #define BACKOFF_TIMEOUT_MS   3000U      /* 되돌아가기 최대 시간 */
 #define PINCH_RETRY_MS       5000U      /* 끼임 정지 후 이 시간 지나면 원래 목표로 다시 시도 */
 #define PINCH_RETRY_MAX      3U         /* 다시 시도 최대 횟수 (0 = 재시도 안 함) */
+/* 닫다가 전압 강하로 끼임이 감지됐을 때 알림 */
+#define VSAG_ALERT_BEEPS     1U         /* 부저 횟수 (한 번 길이 = NODE_BUZZ_ON_MS) */
+#define VSAG_ALERT_LED_MS    600U       /* 초록 LED 점멸 전체 시간 */
+#define VSAG_ALERT_BLINK_MS  100U       /* 켜짐/꺼짐 간격 -> 600ms 동안 3번 깜빡 */
 /* 마스터 목표 히스테리시스 */
 #define CLOSE_DELAY_MS       5000U      /* 닫는 쪽 목표는 이 시간 동안 계속 유지돼야 적용 */
 
@@ -374,6 +379,9 @@ static uint8_t    got_cmd = 0, hb_seq = 0;
 volatile uint8_t  g_zone_lv = 0;       /* 마스터가 알려 준 내 구역 등급 (0x100 [7]) */
 volatile uint8_t  g_buzz_on = 0;       /* 부저 울리는 중 */
 volatile uint32_t g_buzz_cnt = 0;      /* 부저 울린 횟수 (디버깅) */
+static uint8_t    buzz_req = 0;        /* 끼임 알림으로 울릴 횟수 (Buzz_1ms 가 처리) */
+static uint32_t   vsag_led_t0 = 0;     /* 초록 LED 끼임 알림 시작 시각 */
+static uint8_t    vsag_led_on = 0;     /* 1 = 초록 LED 끼임 알림 중 */
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -719,6 +727,13 @@ static void Pinch_Start(uint8_t code, uint8_t src)
     pinch_tgt_pct = g_tgt_pct;
     cur_rpm = 0.0f;                        /* 즉시 정지 */
     phase_rate_q16 = 0;
+    /* 닫다가(여는 방향의 반대로 가다가) 전압 강하로 걸린 경우: 부저 + 초록 LED 알림 */
+    if (src == 2U && dir != OPEN_DIR)
+    {
+        buzz_req = VSAG_ALERT_BEEPS;
+        vsag_led_t0 = HAL_GetTick();
+        vsag_led_on = 1;
+    }
     dir = (int8_t)-dir;                    /* 지금 가던 방향의 반대로 */
     backoff_start = g_enc_pos;
     backoff_ms = HAL_GetTick();
@@ -1545,16 +1560,28 @@ static void Buzz_Set(uint8_t on)
 
 static void Buzz_1ms(void)
 {
-    static uint8_t  left = 0, on = 0, announced = 0, ever = 0;
+    static uint8_t  left = 0, on = 0, announced = 0, ever = 0, alert = 0;
     static uint32_t t0 = 0, done_ms = 0;
     uint32_t now = HAL_GetTick();
+
+    if (!left && buzz_req)                           /* 끼임 알림 요청 (구역 경보 중이면 끝난 뒤에) */
+    {
+        left = buzz_req; buzz_req = 0; alert = 1;
+        on = 1; t0 = now;
+        Buzz_Set(1);
+        return;
+    }
 
     if (left)                                        /* 울리는 중 */
     {
         if (on && (now - t0) >= NODE_BUZZ_ON_MS)
         {
             Buzz_Set(0); on = 0; t0 = now;
-            if (--left == 0) { done_ms = now; ever = 1; }
+            if (--left == 0)
+            {
+                if (!alert) { done_ms = now; ever = 1; }   /* 끼임 알림은 구역 경보 5초 잠금에 영향 없음 */
+                alert = 0;
+            }
         }
         else if (!on && (now - t0) >= NODE_BUZZ_OFF_MS) { Buzz_Set(1); on = 1; t0 = now; }
         return;
@@ -1601,6 +1628,12 @@ static void Fault_Led_1ms(void)
     if (cmd_lost && state != ST_FAULT && red == GPIO_PIN_RESET)
         red = ((t % 1000U) < 80U) ? GPIO_PIN_SET : GPIO_PIN_RESET;
 
+    if (vsag_led_on)                                                            /* 전압 끼임 알림: 초록 0.1초 간격 3번 */
+    {
+        uint32_t e = t - vsag_led_t0;
+        if (e >= VSAG_ALERT_LED_MS) vsag_led_on = 0;
+        else normal = ((e / VSAG_ALERT_BLINK_MS) & 1U) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+    }
     if (g_btn_level == 1U) { normal = GPIO_PIN_SET; run = GPIO_PIN_SET; }      /* 지금 떼면 0도 저장 */
     if ((int32_t)(led_ack_until - t) > 0)                                       /* 저장 확인: 빠르게 3번 */
     {
