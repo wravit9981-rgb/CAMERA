@@ -1,5 +1,5 @@
 /*
- * main_node_window_can_v5_pinch.c — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
+ * main_node_window_can_v5_pinch.c (v5.6) — 스마트 창문 CAN 노드 (STM32G474RET + DRV8313 + AS5047P + INA240)
  *   v5.1 그대로 + [끼임 보강]
  *     - 끼임 판단: INA240 전류 상승  "또는"  전원 전압(PB0) 강하
  *       (모터가 막히면 전류가 오르고, 전원이 약하면 전압이 순간적으로 떨어짐 -> 둘 중 하나라도 일정 시간 계속되면 끼임)
@@ -8,6 +8,12 @@
  *       닫다가 끼면 5% 열리고, 열다가 걸리면 5% 닫힘 -> 그 자리에서 정지 유지 (고장코드 5 / 2)
  *     - 되돌아가기에 시간 제한 (BACKOFF_TIMEOUT_MS) -> 되돌아가다 또 막혀도 끝없이 돌지 않음
  *     - 디버깅: g_pinch_src (1 전류, 2 전압, 3 엔코더 걸림), g_vbus_base, g_i_base
+ *   [v5.6] 닫힘 히스테리시스 + 끼임 후 자동 재시도
+ *     - 마스터 목표가 "닫는 쪽"(더 낮은 %)으로 바뀌면 CLOSE_DELAY_MS(5초) 동안 계속 그 목표일 때만 닫음
+ *       (경보가 풀리자마자 1초 만에 닫히던 것 방지. 여는 쪽은 바로 따라감)
+ *     - 끼임으로 5% 되돌아가 멈춘 뒤 PINCH_RETRY_MS(5초) 지나면 원래 목표(예: 0%)로 다시 이동
+ *       최대 PINCH_RETRY_MAX(3)번. 그래도 막히면 끼임 정지 유지 (SW 짧게 / 새 목표로 해제)
+ *       목표에 제대로 도착하면 재시도 횟수 초기화.  디버깅: g_pinch_retry, g_close_wait
  *   v4 + [추가] 구역 공기질 센서: ENS160 (I2C4, TVOC/eCO2/AQI) + MQ-7 일산화탄소 (PC5 아날로그)
  *        -> 0x120+NODE_ID 로 송신 (마스터가 구역별 위험 등급 판정, 패널/대시보드 표시)
  *        + [추가] 마스터가 구역별 창문 목표를 보내면 (0x100 [4] bit1) 자기 구역 목표 [4+NODE_ID] 를 따름
@@ -70,7 +76,7 @@
  *   LED: NORMAL PC10, RUN PC11, Red PB7
  *
  * ---------------- 디버깅 (Live Expressions) ----------------
- *   끼임: g_i_ma, g_i_base, g_load_pct, g_vbus_mv, g_vbus_base, g_pinch_src, g_fault_reason
+ *   끼임: g_i_ma, g_i_base, g_load_pct, g_vbus_mv, g_vbus_base, g_pinch_src, g_fault_reason, g_pinch_retry, g_close_wait
  *   위치: g_pos, g_target, g_pct, g_enc_raw, g_agc, g_cal_state
  *   기타: g_fan_now, g_tdrv_c, g_tpwr_c, g_tdrv_mv, g_tpwr_mv, g_gw_down, g_gw_up,
  *         g_co_ppm, g_co_mv, g_co_base_mv, g_co_warm, g_ens_ok, g_ens_valid, g_tvoc, g_eco2, g_ens_aqi, g_ens_err
@@ -141,6 +147,10 @@ UART_HandleTypeDef  huart2;
 #define PINCH_BACKOFF_COUNTS ((int32_t)WIN_FULL_COUNTS * PINCH_BACKOFF_PCT / 100)
 #define PINCH_BACKOFF_RPM    12.0f
 #define BACKOFF_TIMEOUT_MS   3000U      /* 되돌아가기 최대 시간 */
+#define PINCH_RETRY_MS       5000U      /* 끼임 정지 후 이 시간 지나면 원래 목표로 다시 시도 */
+#define PINCH_RETRY_MAX      3U         /* 다시 시도 최대 횟수 (0 = 재시도 안 함) */
+/* 마스터 목표 히스테리시스 */
+#define CLOSE_DELAY_MS       5000U      /* 닫는 쪽 목표는 이 시간 동안 계속 유지돼야 적용 */
 
 /* =====================================================================
  *  온도 (패널/마스터 코드와 같은 값으로 맞출 것)
@@ -340,6 +350,9 @@ volatile uint8_t  g_pct = 0;
 static uint8_t    pinch_tgt_pct = 0;
 static int32_t    backoff_start = 0;
 static uint32_t   backoff_ms = 0;
+static uint32_t   pinched_ms = 0;      /* 끼임 정지 상태가 된 시각 */
+volatile uint8_t  g_pinch_retry = 0;   /* 이번 목표에서 끼임 후 다시 시도한 횟수 */
+volatile uint8_t  g_close_wait = 0;    /* 1 = 닫는 목표를 5초 확인 중 */
 
 /* 전류 / 전압 / 온도 */
 volatile float    g_i_ma = 0.0f;
@@ -692,6 +705,7 @@ static uint8_t Set_Target_Pct(uint8_t p)       /* 반환: 1 = 목표 적용됨 *
         g_fault_reason = 0;
         state = ST_HOLD;
     }
+    if (p != g_tgt_pct) g_pinch_retry = 0;     /* 새 목표면 재시도 횟수 초기화 */
     g_tgt_pct = p;
     g_target = (int32_t)p * WIN_FULL_COUNTS / 100;
     return 1;
@@ -756,6 +770,15 @@ static void Stepper_1ms(void)
     if (state == ST_BACKOFF && (HAL_GetTick() - backoff_ms) >= BACKOFF_TIMEOUT_MS)
         state = ST_BACKOFF_STOP;
 
+    /* 끼임 정지 후 5초 지나면 원래 목표(예: 0%)로 다시 시도. 다음 1ms 에 HOLD -> MOVE 로 이어짐 */
+    if (state == ST_PINCHED && g_pinch_retry < PINCH_RETRY_MAX &&
+        (HAL_GetTick() - pinched_ms) >= PINCH_RETRY_MS)
+    {
+        g_pinch_retry++;
+        g_fault_reason = 0;
+        state = ST_HOLD;                   /* g_target 은 끼임 전 목표 그대로 */
+    }
+
     switch (state)
     {
     case ST_MOVE:
@@ -798,8 +821,8 @@ static void Stepper_1ms(void)
 
     if (cur_rpm == 0.0f)
     {
-        if (state == ST_STOPPING)          state = ST_HOLD;
-        else if (state == ST_BACKOFF_STOP) state = ST_PINCHED;
+        if (state == ST_STOPPING)          { state = ST_HOLD; g_pinch_retry = 0; }   /* 목표 도착 */
+        else if (state == ST_BACKOFF_STOP) { state = ST_PINCHED; pinched_ms = HAL_GetTick(); }
     }
 
     if (!enc_sign_known && state == ST_MOVE && (g_enc_pos > 800 || g_enc_pos < -800))
@@ -1154,6 +1177,7 @@ static void Button_1ms(void)
         {
         case ST_PINCHED:                              /* 짧게: 끼임 해제 -> 마지막 목표로 */
             g_fault_reason = 0;
+            g_pinch_retry = 0;
             state = ST_HOLD;
             break;
         case ST_HOLD:
@@ -1413,10 +1437,27 @@ static void CAN_Poll(void)
         }
         if (h.Identifier != CAN_ID_CMD) continue;
         {
-            static uint8_t last_cmd_pct = 0xFFU;      /* 마지막으로 적용한 마스터 목표 */
+            static uint8_t  last_cmd_pct = 0xFFU;     /* 마지막으로 적용한 마스터 목표 */
+            static uint8_t  wait_pct = 0xFFU;         /* 확인 중인 닫는 쪽 목표 */
+            static uint32_t wait_ms = 0;
             uint8_t raw = (d[4] & 0x02U) ? d[4 + NODE_ID] : d[1];   /* 구역별 목표가 있으면 내 구역 것 */
             uint8_t p = Snap_Pct(raw > 100 ? 100 : raw);
-            if (p != last_cmd_pct && state != ST_CAL && state != ST_FAULT && Set_Target_Pct(p)) last_cmd_pct = p;
+            uint32_t now = HAL_GetTick();
+
+            if (p == last_cmd_pct || state == ST_CAL || state == ST_FAULT)
+                wait_pct = 0xFFU;                     /* 원래 목표로 돌아옴 -> 닫기 취소 */
+            else if (last_cmd_pct != 0xFFU && p < last_cmd_pct)
+            {
+                /* 닫는 쪽: 같은 목표가 CLOSE_DELAY_MS 동안 계속 와야 적용 (히스테리시스) */
+                if (wait_pct != p) { wait_pct = p; wait_ms = now; }
+                else if ((now - wait_ms) >= CLOSE_DELAY_MS && Set_Target_Pct(p)) { last_cmd_pct = p; wait_pct = 0xFFU; }
+            }
+            else
+            {
+                wait_pct = 0xFFU;                     /* 여는 쪽(또는 첫 명령): 바로 적용 */
+                if (Set_Target_Pct(p)) last_cmd_pct = p;
+            }
+            g_close_wait = (wait_pct != 0xFFU) ? 1U : 0U;
         }
         fan_tgt = d[2] > 100 ? 100 : d[2];
         if (d[4] & 0x02U) g_zone_lv = (uint8_t)((d[7] >> ((NODE_ID - 1) * 2)) & 0x03U);   /* 구역 등급 묶음 */
