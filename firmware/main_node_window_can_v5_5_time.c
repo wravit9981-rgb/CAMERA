@@ -11,6 +11,7 @@
  *     - 거리 조절: WIN_FULL_COUNTS 만 바꾸면 됨 (16384 = 모터 1바퀴. 예: 조금 덜 열고 싶으면 22000)
  *   [v5.5.1] 열린 상태 유지 히스테리시스: 여는 쪽은 즉시, 닫는 쪽(더 낮은 %)은 CLOSE_DELAY_MS(5초) 동안
  *            계속 같은 목표가 와야 닫음. 그 사이 다시 열라는 명령이 오면 닫기 취소
+ *   [v5.5.2] 1/16 분주 (MICROSTEP 16) + 이동 세기 AMP_RUN 0.24 -> 0.30 (가다가 1~2틱 헛돌거나 걸리는 것 줄이기)
  *            + 0x130+NODE_ID 이벤트(200ms): 닫기 대기 남은 시간 -> 마스터 v2.2 -> 대시보드 "닫기 대기 n초"
  *   [v5.4] POS_FROM_STEPS = 1 : 창문 위치를 자석 엔코더가 아니라 "모터에 보낸 스텝 수" 로 계산
  *     - 자석이 작거나 중심이 어긋나서 엔코더 각도가 한 바퀴를 다 못 따라가고 좁은 범위(약 20도)에서
@@ -259,8 +260,10 @@ UART_HandleTypeDef  huart2;
 /* ===================== 모터 설정 ===================== */
 #define FULL_STEPS_PER_REV   200U
 #define ELEC_CYCLES_PER_REV  (FULL_STEPS_PER_REV / 4U)
-#define AMP_MAX          0.30f
-#define AMP_RUN          0.24f
+#define MICROSTEP        16         /* [v5.5.2] 1 스텝을 몇 칸으로 나눌지: 16 = 1/16 분주 (가능: 1,2,4,8,16,32,64,128,256)
+                                       256 = v5.5 까지 쓰던 값 (가장 부드러움) */
+#define AMP_MAX          0.35f      /* [v5.5.2] 0.30 -> 0.35 */
+#define AMP_RUN          0.30f      /* [v5.5.2] 이동 중 세기 0.24 -> 0.30 (헛돎/걸림 줄이기, 드라이버 온도 확인) */
 #define AMP_HOLD         0.10f
 #define AMP_RAMP_PER_MS  0.0005f
 #define ACCEL_RPM_PER_S  60.0f
@@ -619,7 +622,7 @@ static void Stepper_PwmUpdate(void)
     phase += (uint32_t)inc;
     cmd_phase_total += inc;
 
-    uint32_t idx = phase >> 22;
+    uint32_t idx = (phase >> 22) & ~((1024U / (4U * MICROSTEP)) - 1U);   /* MICROSTEP 칸으로 잘라서 출력 (1024 = 전기 1주기 = 4 스텝) */
     int32_t  s   = sin_tbl[idx];
     int32_t  c   = sin_tbl[(idx + 256U) & 1023U];
 
