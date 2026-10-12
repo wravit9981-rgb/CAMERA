@@ -357,9 +357,37 @@ void connectMqtt() {
 // Wi-Fi (ESP-01 AT 펌웨어 + WiFiEspAT)
 // ---------------------------------------------------------------
 
+// WiFi.init() 실패 시 원인을 구분합니다.
+// "AT"에 응답이 없으면 배선/전원/baud 문제, 응답은 있는데 init이 실패하면
+// WiFiEspAT가 요구하는 AT 1.7+ 명령(AT+CIPRECVMODE)을 지원하지 않는 구형 펌웨어입니다.
+void explainEspFailure() {
+  while (Serial2.available()) Serial2.read();
+  Serial2.print(F("AT\r\n"));
+  unsigned long start = millis();
+  bool anyByte = false, ok = false;
+  char prev = 0;
+  while (millis() - start < 500) {
+    if (!Serial2.available()) continue;
+    char c = Serial2.read();
+    anyByte = true;
+    if (prev == 'O' && c == 'K') ok = true;
+    prev = c;
+  }
+  if (ok) {
+    Serial.println(F("ESP-01 answers AT, but WiFiEspAT init failed: AT firmware is too old "
+                     "(needs AT 1.7+). Run the 'diagnose' env to see AT+GMR."));
+  } else if (anyByte) {
+    Serial.println(F("ESP-01 sends garbage: baud mismatch. Run the 'diagnose' env and set ESP_AT_BAUD."));
+  } else {
+    Serial.println(F("ESP-01 sends nothing: check TX2(D16)->ESP RX, RX2(D17)<-ESP TX, "
+                     "3.3V supply >=300mA, CH_PD/EN and RST tied to 3.3V, common GND."));
+  }
+}
+
 bool initEspAt() {
   Serial2.begin(ESP_AT_BAUD);
   espAtReady = WiFi.init(Serial2);
+  if (!espAtReady) explainEspFailure();
   if (espAtReady) {
     Serial.println(F("ESP-01 AT module detected"));
     char fw[16];
